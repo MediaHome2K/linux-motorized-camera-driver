@@ -141,6 +141,17 @@ import threading
 import time
 import tempfile
 
+APT_PACKAGES = {
+    "module Python cv2 (OpenCV)": "python3-opencv",
+    "cv2.FaceDetectorYN (OpenCV récent avec YuNet)": "python3-opencv",
+    "module Python numpy": "python3-numpy",
+    "v4l2-ctl (v4l-utils)": "v4l-utils",
+    "ffmpeg": "ffmpeg",
+    "module Python Pillow (PIL)": "python3-pil",
+    "module Python tkinter": "python3-tk",
+    "module Python pystray": "python3-pystray",
+}
+
 # External UI translations live beside this script (safe for NixOS deployments).
 LANGUAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_driver.lng")
 CURRENT_LANGUAGE = "en"
@@ -329,6 +340,51 @@ def is_nixos():
     """Détecte NixOS par os-release et ses marqueurs usuels."""
     return (distro_id() == "nixos" or os.path.exists("/etc/NIXOS")
             or os.path.exists("/run/current-system"))
+
+
+def offer_apt_install(missing):
+    """Propose d'installer avec apt les prérequis manquants connus."""
+    try:
+        import distro
+        current_distro = distro.id().lower()
+    except (ImportError, AttributeError, OSError):
+        current_distro = distro_id()
+    if current_distro not in ("debian", "ubuntu", "linuxmint", "pop") or shutil.which("apt") is None:
+        return False
+
+    packages = set()
+    for error in missing:
+        for label, package in APT_PACKAGES.items():
+            pillow_import_error = (label == "module Python Pillow (PIL)"
+                                   and error.startswith("module Python Pillow : "))
+            if error == label or error.startswith(label + " : ") or pillow_import_error:
+                packages.add(package)
+                break
+    installable = sorted(packages)
+    if not installable:
+        return False
+
+    print("Paquets apt à installer : " + ", ".join(installable))
+    try:
+        answer = input("Les installer maintenant avec sudo apt ? [o/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if answer not in ("o", "oui", "y", "yes"):
+        return False
+
+    command = ["apt", "install", "-y", *installable]
+    if os.geteuid() != 0:
+        command.insert(0, "sudo")
+    try:
+        result = subprocess.run(command)
+    except OSError as exc:
+        print(f"Échec de l'installation apt : {exc}", file=sys.stderr)
+        return False
+    if result.returncode != 0:
+        print(f"Échec de l'installation apt (code {result.returncode}).", file=sys.stderr)
+        return False
+
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
 
 
 # Noms de paquets fournis uniquement à titre d'aide : l'exécutable est toujours
@@ -1713,6 +1769,7 @@ def check_startup_prerequisites(args, need_tray):
             advice = ("Installez OpenCV récent avec YuNet, numpy, v4l-utils et, "
                       "pour le tray, pystray/Pillow/Tk. Les commandes externes "
                       "doivent être accessibles dans PATH.")
+        offer_apt_install(errors)
         raise RuntimeError("Prérequis manquants : " + ", ".join(errors) + ". " + advice)
     print("Vérification des prérequis : modules requis et v4l2-ctl disponibles.")
 
