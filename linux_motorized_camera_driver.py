@@ -151,6 +151,9 @@ APT_PACKAGES = {
     "module Python Pillow (PIL)": "python3-pil",
     "module Python tkinter": "python3-tk",
     "module Python pystray": "python3-pystray",
+    "module Python PyGObject (gi)": "python3-gi",
+    "AppIndicator introspection data": "gir1.2-ayatanaappindicator3-0.1",
+    "AppIndicator runtime library": "libayatana-appindicator3-1",
 }
 
 # External UI translations live beside this script (safe for NixOS deployments).
@@ -378,18 +381,31 @@ class V4L2QueryCtrl(ctypes.Structure):
 # Bootstrap NixOS
 # ----------------------------------------------------------------------
 
-def distro_id():
-    """Lit l'identifiant de distribution sans supposer de chemins FHS applicatifs."""
+def distro_ids():
+    """Return os-release ID and ID_LIKE values, including Debian derivatives."""
+    values = {}
     try:
         with open("/etc/os-release", encoding="utf-8") as stream:
             for line in stream:
                 key, separator, value = line.partition("=")
-                if separator and key.strip() == "ID":
-                    return value.strip().strip('"\'').lower()
+                if separator and key.strip() in ("ID", "ID_LIKE"):
+                    values[key.strip()] = value.strip().strip("\"'").lower()
     except OSError:
         pass
-    return ""
+    ids = [values["ID"]] if values.get("ID") else []
+    ids.extend(values.get("ID_LIKE", "").split())
+    return tuple(dict.fromkeys(ids))
 
+
+def distro_id():
+    """Return the primary distribution ID from os-release."""
+    ids = distro_ids()
+    return ids[0] if ids else ""
+
+
+def is_debian_like():
+    """Identify Debian-family systems, including derivatives via ID_LIKE."""
+    return bool(set(distro_ids()) & {"debian", "ubuntu"})
 
 def is_nixos():
     """Détecte NixOS par os-release et ses marqueurs usuels."""
@@ -404,7 +420,7 @@ def offer_apt_install(missing):
         current_distro = distro.id().lower()
     except (ImportError, AttributeError, OSError):
         current_distro = distro_id()
-    if current_distro not in ("debian", "ubuntu", "linuxmint", "pop") or shutil.which("apt") is None:
+    if not is_debian_like() or shutil.which("apt") is None:
         return False
 
     packages = set()
@@ -462,8 +478,8 @@ def require_command(name):
     apt_package, nix_package = COMMAND_PACKAGES.get(name, (name, name))
     if is_nixos():
         guidance = f"NixOS : ajouter {nix_package} à environment.systemPackages ou utiliser nix-shell -p {nix_package}."
-    elif distro_id() in ("debian", "ubuntu", "linuxmint", "pop"):
-        guidance = f"Debian/Ubuntu : installer le paquet avec sudo apt install {apt_package}."
+    elif is_debian_like():
+        guidance = f"Distribution Debian-like : installer le paquet avec sudo apt install {apt_package}."
     else:
         guidance = f"Installez le paquet fournissant {name} (Debian : sudo apt install {apt_package})."
     raise RuntimeError(f"Commande requise introuvable dans PATH : {name}. {guidance}")
@@ -492,6 +508,10 @@ def quick_missing(need_tray=False, need_gui=False, need_virtual_video=False):
             from PIL import Image, ImageDraw  # noqa: F401
         except ImportError:
             missing.append("module Python Pillow (PIL)")
+        try:
+            import gi  # noqa: F401
+        except ImportError:
+            missing.append("module Python PyGObject (gi)")
         try:
             import tkinter  # noqa: F401
         except ImportError:
@@ -532,13 +552,27 @@ def ensure_nix_environment(need_tray=False, need_gui=False, need_virtual_video=F
     os.execvpe(nix_shell, [nix_shell, shell_file, "--run", cmd], env)
 
 
+def tray_backend_dependencies():
+    """Return missing AppIndicator GI typelibs for pystray's selected backend."""
+    try:
+        import gi
+    except ImportError as exc:
+        return [f"module Python PyGObject (gi) : {exc}"]
+    for namespace in ("AyatanaAppIndicator3", "AppIndicator3"):
+        try:
+            gi.require_version(namespace, "0.1")
+            repository = __import__("gi.repository", fromlist=[namespace])
+            getattr(repository, namespace)
+            return []
+        except (ImportError, ValueError, AttributeError) as exc:
+            last_error = exc
+    return [f"AppIndicator introspection data : {last_error}"]
+
+
 def tray_environment_status():
-    """Vérifie la session DBus et le watcher StatusNotifier de Plasma."""
+    """Check the session bus and StatusNotifier host without assuming KDE."""
     if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
         return False, "aucune session DBus détectée"
-    if "kde" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower() and \
-            "plasma" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
-        return False, "session Plasma/KDE non détectée"
     probe = shutil.which("busctl")
     if probe:
         try:
@@ -560,7 +594,9 @@ def tray_environment_status():
                 return True, "session DBus et StatusNotifier disponibles"
         except (OSError, subprocess.SubprocessError):
             pass
-    return False, "service StatusNotifier/DBus indisponible dans cette session"
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "inconnu")
+    return False, (f"aucun hôte StatusNotifier détecté (bureau : {desktop}); "
+                   "vérifiez l'extension/zone de notification du bureau")
 
 # ----------------------------------------------------------------------
 # Vérification détaillée des prérequis
@@ -1794,13 +1830,29 @@ def check_startup_prerequisites(args, need_tray):
                 elif f"module Python {label}" not in errors:
                     errors.append(f"module Python {label} : {exc}")
     if need_tray and not pystray_import_failed:
+        errors.extend(tray_backend_dependencies())
         available, detail = tray_environment_status()
         print(f"Vérification du tray : {'[OK]' if available else '[ERREUR]'} {detail}.")
         if not available:
-            errors.append(detail)
-    if pystray_import_failed:
-        optional_tray_errors = ("module Python pystray", "module Python Pillow",
-                                "module Python tkinter")
+            # A desktop may expose tray icons without KDE's StatusNotifier
+            # watcher, or may not publish the watcher until an icon is started.
+            # Keep this diagnostic non-fatal; pystray itself is the final test.
+            print(f"Avertissement tray : {detail}.", file=sys.stderr)
+    optional_tray_errors = ("module Python pystray", "module Python Pillow",
+                            "module Python tkinter", "module Python PyGObject",
+                            "AppIndicator introspection data")
+    tray_dependency_errors = [error for error in errors
+                              if error.startswith(optional_tray_errors)]
+    if need_tray and tray_dependency_errors:
+        if is_debian_like():
+            print("Le tray AppIndicator peut nécessiter pystray, PyGObject et les "
+                  "bibliothèques/introspection Ayatana AppIndicator (ou le paquet "
+                  "AppIndicator équivalent fourni par cette version Debian-like).",
+                  file=sys.stderr)
+            offer_apt_install([*tray_dependency_errors, "AppIndicator introspection data",
+                               "AppIndicator runtime library"])
+        # Tray is optional; continue with the existing console mode if its
+        # Python dependencies are unavailable rather than blocking camera use.
         errors = [error for error in errors
                   if not error.startswith(optional_tray_errors)]
     fatal_errors = [error for error in errors
@@ -1811,12 +1863,13 @@ def check_startup_prerequisites(args, need_tray):
             advice = "Vérifiez l'installation Nix : opencv4 avec enableGtk3, numpy, pystray, pillow, tk et v4l-utils."
         elif is_nixos():
             advice = "Impossible de démarrer nix-shell automatiquement ; installez opencv4 (enableGtk3), numpy, pystray, pillow, tk et v4l-utils."
-        elif distro_id() in ("debian", "ubuntu", "linuxmint", "pop"):
-            advice = ("Sur Debian/Ubuntu, installez au besoin : sudo apt install "
-                      "python3-opencv python3-numpy v4l-utils ffmpeg python3-pil "
-                      "python3-tk python3-pystray. Une version récente d'OpenCV "
-                      "avec FaceDetectorYN est nécessaire ; le script n'installe "
-                      "pas de paquets automatiquement.")
+        elif is_debian_like():
+            advice = ("Sur une distribution Debian-like, installez au besoin : "
+                      "sudo apt install python3-opencv python3-numpy v4l-utils "
+                      "ffmpeg python3-pil python3-tk python3-pystray python3-gi "
+                      "gir1.2-ayatanaappindicator3-0.1 libayatana-appindicator3-1. "
+                      "Une version récente d'OpenCV avec FaceDetectorYN est nécessaire ; "
+                      "le script n'installe pas de paquets automatiquement.")
         else:
             advice = ("Installez OpenCV récent avec YuNet, numpy, v4l-utils et, "
                       "pour le tray, pystray/Pillow/Tk. Les commandes externes "
