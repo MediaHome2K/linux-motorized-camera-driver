@@ -147,6 +147,7 @@ APT_PACKAGES = {
     "module Python numpy": "python3-numpy",
     "v4l2-ctl (v4l-utils)": "v4l-utils",
     "ffmpeg": "ffmpeg",
+    "curl (téléchargement du modèle YuNet)": "curl",
     "module Python Pillow (PIL)": "python3-pil",
     "module Python tkinter": "python3-tk",
     "module Python pystray": "python3-pystray",
@@ -209,7 +210,61 @@ FLAG_INACTIVE = 0x0010
 FLAG_WRITE_ONLY = 0x0040
 
 MODEL_NAME = "face_detection_yunet_2023mar.onnx"
+MODEL_URL = "https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx"
 DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), MODEL_NAME)
+
+
+def download_model(model_path):
+    """Télécharge le modèle YuNet dans un fichier temporaire, puis le valide."""
+    part_path = model_path + ".part"
+    downloader = shutil.which("curl") or shutil.which("wget")
+    if downloader is None:
+        # L'installation peut relancer ce script après avoir ajouté curl.
+        offer_apt_install(["curl"])
+        downloader = shutil.which("curl") or shutil.which("wget")
+
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(model_path)), exist_ok=True)
+        if os.path.exists(part_path):
+            os.remove(part_path)
+        if downloader and os.path.basename(downloader) == "curl":
+            command = [downloader, "-L", "--fail", "-o", part_path, MODEL_URL]
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, timeout=120)
+            if result.returncode != 0:
+                detail = result.stderr.strip() or f"code de sortie {result.returncode}"
+                print(f"Échec du téléchargement du modèle avec curl : {detail}", file=sys.stderr)
+                return False
+        elif downloader:
+            command = [downloader, "-O", part_path, MODEL_URL]
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, timeout=120)
+            if result.returncode != 0:
+                detail = result.stderr.strip() or f"code de sortie {result.returncode}"
+                print(f"Échec du téléchargement du modèle avec wget : {detail}", file=sys.stderr)
+                return False
+        else:
+            import urllib.request
+            print("curl et wget absents ; téléchargement du modèle via urllib.")
+            urllib.request.urlretrieve(MODEL_URL, part_path)
+
+        if not os.path.isfile(part_path) or os.path.getsize(part_path) <= 100_000:
+            size = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
+            print(f"Échec : modèle téléchargé incomplet ou trop petit ({size} octets).",
+                  file=sys.stderr)
+            return False
+        os.replace(part_path, model_path)
+        print(f"Modèle YuNet téléchargé : {model_path}")
+        return True
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        print(f"Échec du téléchargement du modèle YuNet : {exc}", file=sys.stderr)
+        return False
+    finally:
+        try:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+        except OSError:
+            pass
 
 DETECT_W = 320
 DETECT_H = 240
@@ -357,7 +412,7 @@ def offer_apt_install(missing):
         for label, package in APT_PACKAGES.items():
             pillow_import_error = (label == "module Python Pillow (PIL)"
                                    and error.startswith("module Python Pillow : "))
-            if error == label or error.startswith(label + " : ") or pillow_import_error:
+            if error == label or error == package or error.startswith(label + " : ") or pillow_import_error:
                 packages.add(package)
                 break
     installable = sorted(packages)
@@ -536,17 +591,14 @@ def check_prerequisites(args):
         fail("cv2.FaceDetectorYN absent : OpenCV >= 4.5.4 requis")
 
     model = os.path.expanduser(args.model)
-    if os.path.isfile(model):
-        if os.path.getsize(model) < 100_000:
-            fail(f"Modèle suspect (trop petit) : {model} ; retélécharge-le")
-        else:
-            ok(f"Modèle YuNet : {model}")
+    if os.path.isfile(model) and os.path.getsize(model) >= 100_000:
+        ok(f"Modèle YuNet : {model}")
+    elif download_model(model):
+        ok(f"Modèle YuNet : {model}")
     else:
         fail(
-            f"Modèle introuvable : {model}\n"
-            "         curl -L -o face_detection_yunet_2023mar.onnx "
-            "https://huggingface.co/opencv/face_detection_yunet/resolve/main/"
-            "face_detection_yunet_2023mar.onnx"
+            f"Modèle YuNet absent ou invalide : {model} ; téléchargement automatique échoué.\n"
+            f"         curl -L --fail -o '{model}' {MODEL_URL}"
         )
 
     try:
