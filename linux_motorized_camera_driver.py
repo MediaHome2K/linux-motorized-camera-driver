@@ -596,7 +596,25 @@ def tray_environment_status():
             pass
     desktop = os.environ.get("XDG_CURRENT_DESKTOP", "inconnu")
     return False, (f"aucun hôte StatusNotifier détecté (bureau : {desktop}); "
-                   "vérifiez l'extension/zone de notification du bureau")
+                   "l’icône de tray peut être invisible. Vérifiez la prise en charge "
+                   "de la zone de notification ; le script ne peut pas installer "
+                   "ni activer une extension de bureau")
+
+
+def load_optional_imagetk():
+    """Load Tk's Pillow bridge; the tray can still work without image preview."""
+    try:
+        from PIL import ImageTk
+        return ImageTk
+    except (ImportError, OSError) as exc:
+        print(
+            "Avertissement : liaison Pillow/Tk indisponible ; l’aperçu vidéo est "
+            "désactivé, mais l’interface tray reste disponible. Sur Debian-like, "
+            "installez le paquet python3-tk correspondant à Python (ainsi que "
+            "python3-pil si Pillow manque) ; sur NixOS, vérifiez que le shell "
+            "intégré fournit tk et pillow. Détail : " + str(exc),
+            file=sys.stderr)
+        return None
 
 # ----------------------------------------------------------------------
 # Vérification détaillée des prérequis
@@ -1832,7 +1850,7 @@ def check_startup_prerequisites(args, need_tray):
     if need_tray and not pystray_import_failed:
         errors.extend(tray_backend_dependencies())
         available, detail = tray_environment_status()
-        print(f"Vérification du tray : {'[OK]' if available else '[ERREUR]'} {detail}.")
+        print(f"Diagnostic StatusNotifier : {'[OK]' if available else '[AVERTISSEMENT]'} {detail}.")
         if not available:
             # A desktop may expose tray icons without KDE's StatusNotifier
             # watcher, or may not publish the watcher until an icon is started.
@@ -1899,14 +1917,26 @@ def reset_from_menu(device):
 class TrayApplication:
     """Tkinter reste dans le thread principal; suivi et icône ont leurs threads."""
     def __init__(self, args, settings):
-        import tkinter as tk
-        from tkinter import messagebox
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+        except ImportError as exc:
+            raise RuntimeError(
+                "Tkinter/Tk est indisponible ; l’interface tray ne peut pas démarrer. "
+                "Installez les liaisons Tk correspondant à Python (Debian-like : "
+                "sudo apt install python3-tk ; NixOS : vérifiez le shell intégré)."
+            ) from exc
         import pystray
-        from PIL import Image, ImageDraw, ImageTk
+        from PIL import Image, ImageDraw
+        image_tk = load_optional_imagetk()
         self.tk, self.pystray = tk, pystray
         self.messagebox = messagebox
-        self.Image, self.ImageDraw, self.ImageTk = Image, ImageDraw, ImageTk
+        self.Image, self.ImageDraw, self.ImageTk = Image, ImageDraw, image_tk
+        self.preview_available = image_tk is not None
         self.args = args
+        if not self.preview_available:
+            args.preview = False
+            settings["preview"] = False
         self.shared = {"lock": threading.Lock(), "values": settings}
         self.commands = queue.Queue()
         self.worker = None
@@ -1962,7 +1992,9 @@ class TrayApplication:
                           ("invert_pan", "invert_pan"), ("virtual_video", "virtual_video"))
         for row, (key, label_key) in enumerate(checkbox_specs, 6):
             var = tk.BooleanVar(value=values[key]); self.vars[key] = var
-            tk.Checkbutton(frame, text=tr(label_key), variable=var).grid(
+            preview_disabled = key == "preview" and not self.preview_available
+            tk.Checkbutton(frame, text=tr(label_key), variable=var,
+                           state="disabled" if preview_disabled else "normal").grid(
                 row=row, column=0, columnspan=2, sticky="w", pady=3)
         tk.Label(frame, text=tr("language")).grid(row=10, column=0, sticky="w", pady=3)
         lang_var = tk.StringVar(value=values.get("language", "en")); self.vars["language"] = lang_var
@@ -2091,6 +2123,9 @@ class TrayApplication:
 
     def _toggle_preview(self):
         """Active/désactive l'aperçu vidéo."""
+        if not self.preview_available:
+            print("Aperçu désactivé : liaison Pillow/Tk indisponible.", file=sys.stderr)
+            return
         with self.shared["lock"]:
             self.shared["values"]["preview"] = not self.shared["values"]["preview"]
             enabled = self.shared["values"]["preview"]
@@ -2315,12 +2350,15 @@ class TrayApplication:
             virtual_enabled = bool(self.shared["values"].get("virtual_video", False))
         zoom_text = tr("zoom_on") if zoom_enabled else tr("zoom_off")
         preview_text = tr("preview_on") if preview_enabled else tr("preview_off")
+        if not self.preview_available:
+            preview_text += " (indisponible)"
         virtual_text = tr("virtual_on") if virtual_enabled else tr("virtual_off")
         tracking_text = tr("stop_tracking") if self._tracking_is_active() else tr("start_tracking")
         return pystray.Menu(
             pystray.MenuItem(tracking_text, lambda icon, item: self.commands.put("toggle_tracking")),
             pystray.MenuItem(zoom_text, lambda icon, item: self.commands.put("zoom")),
-            pystray.MenuItem(preview_text, lambda icon, item: self.commands.put("preview")),
+            pystray.MenuItem(preview_text, lambda icon, item: self.commands.put("preview"),
+                             enabled=self.preview_available),
             pystray.MenuItem(virtual_text, lambda icon, item: self.commands.put("virtual_video")),
             pystray.MenuItem(tr("manual_menu"), lambda icon, item: self.commands.put("manual")),
             pystray.MenuItem(tr("reset_menu"), lambda icon, item: self.commands.put("reset")),
@@ -2380,7 +2418,7 @@ class TrayApplication:
             preview_enabled = bool(self.shared["values"]["preview"])
 
         try:
-            if frame is not None and preview_enabled:
+            if frame is not None and preview_enabled and self.preview_available:
                 # Recréer la fenêtre si elle a été détruite
                 if not self.preview_label.winfo_exists():
                     self._rebuild_preview()
@@ -2673,6 +2711,17 @@ def main():
             args.no_tray = True
             need_tray = False
     if args.no_tray:
+        if args.preview:
+            try:
+                import tkinter  # noqa: F401
+                from PIL import ImageTk  # noqa: F401
+            except (ImportError, OSError) as exc:
+                print(
+                    "Avertissement : prévisualisation Tk indisponible ; poursuite "
+                    "sans fenêtre d’aperçu. Sur Debian-like, installez python3-tk "
+                    "(et python3-pil si nécessaire). Détail : " + str(exc),
+                    file=sys.stderr)
+                args.preview = False
         stop = threading.Event()
         def request_stop(_signum, _frame): stop.set()
         signal.signal(signal.SIGINT, request_stop)
@@ -2684,7 +2733,19 @@ def main():
         else:
             run_tracking(args, stop=stop)
         return
-    app = TrayApplication(args, settings)
+    try:
+        app = TrayApplication(args, settings)
+    except RuntimeError as exc:
+        print(f"Avertissement : {exc} Poursuite en mode terminal sans tray.",
+              file=sys.stderr)
+        args.no_tray = True
+        args.preview = False
+        stop = threading.Event()
+        def request_stop(_signum, _frame): stop.set()
+        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_stop)
+        run_tracking(args, stop=stop)
+        return
     try:
         app.run()
     except KeyboardInterrupt:
