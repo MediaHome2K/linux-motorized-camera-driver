@@ -149,6 +149,7 @@ APT_PACKAGES = {
     "ffmpeg": "ffmpeg",
     "curl (téléchargement du modèle YuNet)": "curl",
     "module Python Pillow (PIL)": "python3-pil",
+    "module Pillow ImageTk": "python3-pil.imagetk",
     "module Python tkinter": "python3-tk",
     "module Python pystray": "python3-pystray",
     "module Python PyGObject (gi)": "python3-gi",
@@ -298,7 +299,7 @@ in pkgs.mkShell {
     pkgs.ffmpeg
   ] ++ appindicatorPkgs;
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
-    stdenv.cc.cc.lib zlib libGL glib gtk3 dbus
+    stdenv.cc.cc.lib zlib libGL glib gtk3 tk dbus
     libxkbcommon fontconfig freetype libxcb libx11 libxext libxrender libxi
     libsm libice wayland
   ] ++ appindicatorPkgs) + ":/run/opengl-driver/lib";
@@ -601,8 +602,26 @@ def tray_environment_status():
                    "ni activer une extension de bureau")
 
 
+def is_gnome_session():
+    """Detect GNOME from the standard desktop/session environment variables."""
+    values = " ".join(os.environ.get(key, "") for key in
+                      ("XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP",
+                       "DESKTOP_SESSION", "GDMSESSION"))
+    desktops = values.upper().replace(":", " ").replace("-", " ").split()
+    return any(token == "GNOME" or token.startswith("GNOME") for token in desktops)
+
+
+def should_disable_gnome_tray():
+    """Avoid AppIndicator/GTK startup when GNOME has no StatusNotifier host."""
+    backend = os.environ.get("PYSTRAY_BACKEND", "appindicator").lower()
+    if not is_gnome_session() or backend != "appindicator":
+        return False, ""
+    available, detail = tray_environment_status()
+    return not available, detail
+
+
 def load_optional_imagetk():
-    """Load Tk's Pillow bridge; the tray can still work without image preview."""
+    """Load Pillow's optional ImageTk bridge; tray use does not require preview."""
     try:
         from PIL import ImageTk
         return ImageTk
@@ -610,9 +629,9 @@ def load_optional_imagetk():
         print(
             "Avertissement : liaison Pillow/Tk indisponible ; l’aperçu vidéo est "
             "désactivé, mais l’interface tray reste disponible. Sur Debian-like, "
-            "installez le paquet python3-tk correspondant à Python (ainsi que "
-            "python3-pil si Pillow manque) ; sur NixOS, vérifiez que le shell "
-            "intégré fournit tk et pillow. Détail : " + str(exc),
+            "installez python3-tk et python3-pil.imagetk (ainsi que python3-pil "
+            "si Pillow manque) ; sur NixOS, vérifiez que le shell intégré fournit "
+            "tk, tkinter et pillow avec ImageTk. Détail : " + str(exc),
             file=sys.stderr)
         return None
 
@@ -1884,7 +1903,8 @@ def check_startup_prerequisites(args, need_tray):
         elif is_debian_like():
             advice = ("Sur une distribution Debian-like, installez au besoin : "
                       "sudo apt install python3-opencv python3-numpy v4l-utils "
-                      "ffmpeg python3-pil python3-tk python3-pystray python3-gi "
+                      "ffmpeg python3-pil python3-pil.imagetk python3-tk "
+                      "python3-pystray python3-gi "
                       "gir1.2-ayatanaappindicator3-0.1 libayatana-appindicator3-1. "
                       "Une version récente d'OpenCV avec FaceDetectorYN est nécessaire ; "
                       "le script n'installe pas de paquets automatiquement.")
@@ -1952,6 +1972,7 @@ class TrayApplication:
         self._tracking_pending = False
         self._last_tracking_state = False
         self.closed = threading.Event()
+        self.tray_failed = False
         self.root = tk.Tk()
         self.root.title(tr("settings_title"))
         self.root.resizable(False, False)
@@ -2367,10 +2388,12 @@ class TrayApplication:
         )
 
     def _run_icon(self):
-        self.icon = self.pystray.Icon("follow_me", self._icon_image(), tr("app_name"), menu=self._build_menu())
         try:
+            self.icon = self.pystray.Icon(
+                "follow_me", self._icon_image(), tr("app_name"), menu=self._build_menu())
             self.icon.run()
         except Exception as exc:
+            self.tray_failed = True
             print(f"Erreur du tray : {exc}", file=sys.stderr)
             self.commands.put("tray_error")
 
@@ -2396,7 +2419,12 @@ class TrayApplication:
                 self._show_manual()
             elif command == "settings":
                 self.show_settings()
-            elif command in ("quit", "tray_error"):
+            elif command == "tray_error":
+                # The camera worker is stopped by shutdown; run() restarts it in
+                # terminal mode after Tk has been closed cleanly.
+                self.shutdown()
+                return
+            elif command == "quit":
                 self.shutdown()
                 return
             if getattr(self, "_closing", False):
@@ -2476,6 +2504,14 @@ class TrayApplication:
         if self.manual_thread is not None:
             self.manual_thread.join(timeout=3)
         self.closed.set()
+        if self.tray_failed:
+            print("Avertissement : l’icône tray a échoué ; poursuite du suivi en mode terminal.",
+                  file=sys.stderr)
+            stop = threading.Event()
+            def request_stop(_signum, _frame): stop.set()
+            signal.signal(signal.SIGINT, request_stop)
+            signal.signal(signal.SIGTERM, request_stop)
+            run_tracking(self.args, stop=stop)
 
 
 def run_console_preview(args, stop=None):
@@ -2695,6 +2731,17 @@ def main():
         return
     close_previous_instances()
     need_tray = not args.no_tray
+    if need_tray:
+        disable_tray, tray_detail = should_disable_gnome_tray()
+        if disable_tray:
+            print(
+                "Avertissement : GNOME n’expose aucun hôte StatusNotifier/AppIndicator "
+                f"({tray_detail}) ; démarrage sans tray afin d’éviter l’initialisation "
+                "GTK défaillante. Le suivi continue en mode terminal. Activez une "
+                "extension GNOME compatible AppIndicator, puis relancez le script.",
+                file=sys.stderr)
+            args.no_tray = True
+            need_tray = False
     settings = load_settings(args) if need_tray else None
     global CURRENT_LANGUAGE
     if settings is not None:
@@ -2719,7 +2766,8 @@ def main():
                 print(
                     "Avertissement : prévisualisation Tk indisponible ; poursuite "
                     "sans fenêtre d’aperçu. Sur Debian-like, installez python3-tk "
-                    "(et python3-pil si nécessaire). Détail : " + str(exc),
+                    "et python3-pil.imagetk (ainsi que python3-pil si nécessaire). "
+                    "Détail : " + str(exc),
                     file=sys.stderr)
                 args.preview = False
         stop = threading.Event()
